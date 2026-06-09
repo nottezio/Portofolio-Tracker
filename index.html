@@ -1555,68 +1555,63 @@ async function refreshAllSheets() {
 // Unified refresh — pull Drive first, then update prices, then push
 async function refreshAllNow() {
   const hasGithub = isGithubConfigured();
+  const hasWorker = isPriceWorkerConfigured();
   const hasSheets = Object.values(state.settings.sheetsSyncUrls || {}).some(v => v);
   const hasDrive = isAppsScriptConfigured();
 
-  // PRIMARY PATH: GitHub backend
-  if (hasGithub) {
-    // Step 1: Capture local lastModified BEFORE any sync operations
-    //   so we can detect whether we have unpushed local edits.
+  // PRIMARY PATH: GitHub for data sync + Worker for prices
+  if (hasGithub || hasWorker) {
     const localTimeBefore = new Date(state.lastModified || 0).getTime();
 
-    // Step 2: Pull data + prices in parallel (no push first — that was the bug)
-    const [pullResult, pricesResult] = await Promise.all([
-      githubPull({ silent: true }),
-      githubPullPrices({ silent: true })
-    ]);
+    // Fetch data sync (GitHub) and prices (Worker) in parallel
+    const tasks = [];
+    tasks.push(hasGithub ? githubPull({ silent: true }) : Promise.resolve({ ok: false }));
+    tasks.push(hasWorker ? fetchPricesFromWorker().then(p => ({ ok: true, prices: p })).catch(e => ({ ok: false, error: e.message }))
+                         : githubPullPrices({ silent: true }));
+    const [pullResult, pricesResult] = await Promise.all(tasks);
 
-    // Step 3: Apply prices to whatever state we have now (might be remote or local)
+    // Apply prices
     let appliedCount = 0;
+    let priceError = null;
     if (pricesResult.ok && pricesResult.prices) {
-      const r = applyPrices(pricesResult.prices);
-      appliedCount = r.applied;
+      appliedCount = applyPrices(pricesResult.prices).applied;
+    } else if (pricesResult.error) {
+      priceError = pricesResult.error;
     }
 
-    // Step 4: Decide if we need to push.
-    //   - If pull said "local is newer" (localNewer) → user has unpushed edits, push now
-    //   - If we just applied prices (not pulled) → push to share with other devices
-    //   - If pull said "in sync" or "pulled remote" → no need to push portfolio
-    //     (but applied prices need pushing IF there were any)
+    // Decide if push needed
     const localTimeAfter = new Date(state.lastModified || 0).getTime();
     const localChangedDuringSync = localTimeAfter > localTimeBefore + 100;
 
-    if (pullResult.localNewer || localChangedDuringSync || (appliedCount > 0 && !pullResult.pulled)) {
-      // We have changes that should go up to GitHub
-      // Bump lastModified so other devices know to pull this version
-      saveState(true, true); // silent (no auto-schedule), but DO bump time
+    if (hasGithub && (pullResult.localNewer || localChangedDuringSync || (appliedCount > 0 && !pullResult.pulled))) {
+      saveState(true, true);
       await githubPush({ silent: true });
     } else if (appliedCount > 0) {
-      // Prices applied but data was just pulled — save without bumping
       saveState(true, false);
     }
 
     render();
 
-    // Build user feedback
+    // Feedback
     const ageMin = pricesResult.prices?.lastUpdated
       ? Math.round((Date.now() - new Date(pricesResult.prices.lastUpdated).getTime()) / 60000)
       : null;
-    const ageStr = ageMin != null ? ` (harga ${ageMin}m lalu)` : '';
-    if (pullResult.pulled) {
-      toast(`✓ Pulled latest dari device lain${ageStr}`);
-    } else if (pullResult.localNewer) {
-      toast(`✓ Local edits ter-push${ageStr}`);
+    const ageStr = ageMin != null && ageMin > 1 ? ` (${ageMin}m lalu)` : '';
+    if (priceError) {
+      toast(`⚠ Sync data OK, tapi harga gagal: ${priceError}`);
+    } else if (pullResult.pulled) {
+      toast(`✓ Pulled dari device lain · ${appliedCount} harga${ageStr}`);
     } else if (appliedCount > 0) {
       toast(`✓ ${appliedCount} harga di-update${ageStr}`);
     } else {
-      toast(`✓ Sudah sinkron${ageStr}`);
+      toast(`✓ Sudah sinkron`);
     }
     return;
   }
 
   // LEGACY PATH: Apps Script + Sheets
   if (!hasSheets && !hasDrive) {
-    toast('Setup GitHub di Settings dulu');
+    toast('Setup GitHub + Price Worker di Settings dulu');
     return;
   }
   if (hasDrive) await appsScriptPush({ silent: true });
@@ -3300,14 +3295,41 @@ function renderSettings() {
           <button class="btn" onclick="githubPush()">⬆ Push</button>
         </div>
       </div>
+    </div>
+
+    <div class="settings-group">
+      <div class="settings-group-title">⚡ Live Prices (Cloudflare Worker)</div>
+      <div style="padding:12px 16px; background:var(--accent-bg); border-bottom:1px solid var(--hairline); font-size:0.78rem; line-height:1.5; color:var(--ink-soft)">
+        <strong>Harga real-time</strong> via Cloudflare Worker (saham, crypto, kurs).
+        Reliable, gratis, tanpa GitHub Action. Setup ~10 menit.
+        <button class="btn btn-ghost" style="padding:4px 8px; margin-left:8px; font-size:0.72rem" onclick="showWorkerGuide()">📖 Tutorial Setup</button>
+      </div>
+      <div class="settings-row" style="flex-direction:column; align-items:stretch; gap:6px">
+        <div class="settings-row-label">Worker URL</div>
+        <div class="settings-row-desc">URL Worker Anda, akhiran <code>.workers.dev</code></div>
+        <input type="text" class="form-input"
+               value="${esc(state.settings.priceWorker?.url || '')}"
+               placeholder="https://portfolio-prices.username.workers.dev"
+               onchange="updatePriceWorkerConfig('url', this.value.trim())"
+               style="font-size:0.8rem; font-family:var(--mono)">
+      </div>
+      <div class="settings-row" style="flex-direction:column; align-items:stretch; gap:6px">
+        <div class="settings-row-label">Token (opsional)</div>
+        <div class="settings-row-desc">Hanya kalau Anda set <code>SHARED_SECRET</code> di Worker. Kosongkan kalau tidak.</div>
+        <input type="password" class="form-input"
+               value="${esc(state.settings.priceWorker?.token || '')}"
+               placeholder="(kosongkan kalau tanpa auth)"
+               onchange="updatePriceWorkerConfig('token', this.value.trim())"
+               style="font-size:0.8rem; font-family:var(--mono)">
+      </div>
       <div class="settings-row" style="background:var(--paper-sunken); gap:8px; flex-wrap:wrap">
         <div style="flex:1; min-width:150px">
-          <div class="settings-row-label" style="font-weight:600">Auto Price Updates</div>
-          <div class="settings-row-desc">Install GitHub Action — auto-fetch harga setiap 15 menit</div>
+          <div class="settings-row-label" style="font-weight:600">Test & Refresh</div>
+          <div class="settings-row-desc">Cek koneksi Worker & ambil harga sekarang</div>
         </div>
         <div class="settings-row-control" style="display:flex; gap:6px; flex-wrap:wrap">
-          <button class="btn" onclick="githubInstallWorkflow()">📦 Install</button>
-          <button class="btn btn-primary" onclick="githubTriggerAction()">▶ Run Now</button>
+          <button class="btn" onclick="testPriceWorker()">🧪 Test</button>
+          <button class="btn btn-primary" onclick="refreshAllNow()">⚡ Refresh Harga</button>
         </div>
       </div>
     </div>
@@ -4227,8 +4249,13 @@ function init() {
 
         // Always do the actual pull (uses fixed timestamp logic now)
         await githubPull({ silent: true });
-        // Also pull latest prices
-        const pr = await githubPullPrices({ silent: true });
+        // Fetch latest prices — prefer Worker, fall back to prices.json
+        let pr;
+        if (isPriceWorkerConfigured()) {
+          pr = await fetchPricesFromWorker().then(p => ({ ok: true, prices: p })).catch(() => ({ ok: false }));
+        } else {
+          pr = await githubPullPrices({ silent: true });
+        }
         if (pr.ok && pr.prices) {
           applyPrices(pr.prices);
           saveState(true, false); // preserve timestamp from pull
@@ -4237,6 +4264,12 @@ function init() {
       }, 600);
     }
     updateGithubDot('idle');
+  } else if (isPriceWorkerConfigured()) {
+    // No GitHub sync but Worker configured — still fetch prices on open
+    setTimeout(async () => {
+      const p = await fetchPricesFromWorker().catch(() => null);
+      if (p) { applyPrices(p); saveState(true, false); render(); }
+    }, 600);
   }
 
   // LEGACY: Apps Script auto-pull (kept for users still on old setup)
@@ -4256,6 +4289,80 @@ let githubPushTimer = null;
 let lastPortfolioSha = null; // SHA from last successful read/write — used for conflict detection
 let lastPricesPullTime = 0;
 let lastPricesData = null;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRICE WORKER — Cloudflare Worker proxy for live prices (stocks via Yahoo,
+// crypto via CoinGecko, kurs via Frankfurter). Replaces GitHub Action.
+// ═══════════════════════════════════════════════════════════════════════════
+function getPriceWorkerConfig() {
+  const cfg = state.settings.priceWorker || {};
+  return {
+    url: (cfg.url || '').trim(),
+    token: (cfg.token || '').trim()
+  };
+}
+
+function isPriceWorkerConfigured() {
+  return Boolean(getPriceWorkerConfig().url);
+}
+
+function updatePriceWorkerConfig(key, value) {
+  if (!state.settings.priceWorker) state.settings.priceWorker = {};
+  state.settings.priceWorker[key] = value;
+  saveState(true);
+}
+
+// Collect symbols from portfolio, call Worker, return prices object
+// (same shape as old prices.json: { kursUsdIdr, stocks, crypto })
+async function fetchPricesFromWorker() {
+  const { url, token } = getPriceWorkerConfig();
+  if (!url) throw new Error('Price Worker URL belum di-set di Settings');
+
+  // Collect stock symbols (IDX with .JK suffix, US as-is)
+  const idxSymbols = (state.stockbit?.positions || [])
+    .map(p => (p.kode || '').toUpperCase()).filter(Boolean).map(k => k + '.JK');
+  const usSymbols = (state.gotrade?.positions || [])
+    .map(p => (p.ticker || '').toUpperCase()).filter(Boolean);
+  const stocks = [...new Set([...idxSymbols, ...usSymbols])];
+
+  // Collect crypto CoinGecko IDs
+  const cryptoMap = CRYPTO_SYMBOL_MAP || {};
+  const cryptoIds = (state.pluang?.positions || [])
+    .map(p => cryptoMap[(p.simbol || '').toUpperCase()])
+    .filter(Boolean);
+
+  // Build URL
+  const params = new URLSearchParams();
+  if (stocks.length) params.set('stocks', stocks.join(','));
+  if (cryptoIds.length) params.set('crypto', cryptoIds.join(','));
+  if (token) params.set('token', token);
+
+  const fetchUrl = `${url}${url.includes('?') ? '&' : '?'}${params.toString()}`;
+  const res = await fetch(fetchUrl, { cache: 'no-cache' });
+  if (!res.ok) {
+    if (res.status === 401) throw new Error('Token Worker salah');
+    throw new Error(`Worker HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+// Test the Worker connection
+async function testPriceWorker() {
+  const { url } = getPriceWorkerConfig();
+  if (!url) { alert('Isi Worker URL dulu'); return; }
+  toast('Testing Price Worker...');
+  try {
+    const data = await fetchPricesFromWorker();
+    const kursStr = data.kursUsdIdr ? `kurs ${Math.round(data.kursUsdIdr).toLocaleString('id-ID')}` : 'kurs gagal';
+    const stockCount = Object.keys(data.stocks || {}).length;
+    const cryptoCount = Object.keys(data.crypto || {}).length;
+    toast(`✓ Worker OK — ${kursStr}, ${stockCount} saham, ${cryptoCount} crypto`);
+  } catch (err) {
+    alert(`Worker test gagal: ${err.message}\n\nCek:\n• URL benar (akhiran .workers.dev)\n• Worker sudah di-deploy\n• Token cocok (kalau pakai SHARED_SECRET)`);
+  }
+}
 
 function getGithubConfig() {
   const cfg = state.settings.github || {};
@@ -4810,6 +4917,75 @@ function showSheetsGuide() {
   document.getElementById('modalBackdrop').classList.add('active');
 }
 
+function showWorkerGuide() {
+  document.getElementById('modalTitle').textContent = '⚡ Setup Cloudflare Worker';
+  document.getElementById('modalBody').innerHTML = `
+    <div style="font-size:0.85rem; line-height:1.7; max-height:60vh; overflow-y:auto">
+      <div style="background:var(--accent-bg); padding:10px 12px; border-radius:6px; margin-bottom:14px">
+        <strong>Goal:</strong> Worker = proxy gratis yang fetch harga saham (Yahoo), crypto (CoinGecko), kurs (Frankfurter), lalu kirim ke app dengan CORS header. Real-time, reliable, ~10 menit setup.
+      </div>
+
+      <div style="font-weight:600; color:var(--accent); margin-bottom:6px">1. Buat Akun Cloudflare (gratis)</div>
+      <ol style="margin-left:20px; margin-bottom:14px">
+        <li>Buka <a href="https://dash.cloudflare.com/sign-up" target="_blank" rel="noopener">dash.cloudflare.com/sign-up</a></li>
+        <li>Daftar dengan email (gratis, tidak perlu kartu kredit)</li>
+        <li>Verifikasi email</li>
+      </ol>
+
+      <div style="font-weight:600; color:var(--accent); margin-bottom:6px">2. Buat Worker</div>
+      <ol style="margin-left:20px; margin-bottom:14px">
+        <li>Di dashboard → menu kiri → <strong>Workers & Pages</strong></li>
+        <li>Klik <strong>Create</strong> → <strong>Create Worker</strong></li>
+        <li>Beri nama (misal <code>portfolio-prices</code>) → <strong>Deploy</strong></li>
+        <li>Setelah deploy → klik <strong>Edit code</strong></li>
+        <li>Hapus semua kode default di editor</li>
+        <li>Paste isi file <code>price-worker.js</code> yang saya berikan</li>
+        <li>Klik <strong>Deploy</strong> (kanan atas)</li>
+      </ol>
+
+      <div style="font-weight:600; color:var(--accent); margin-bottom:6px">3. Copy Worker URL</div>
+      <ol style="margin-left:20px; margin-bottom:14px">
+        <li>Setelah deploy, URL muncul di atas, format:<br>
+          <code style="font-size:0.78rem">https://portfolio-prices.USERNAME.workers.dev</code></li>
+        <li>Copy URL ini</li>
+        <li>Paste ke field <strong>Worker URL</strong> di Settings app</li>
+        <li>Klik <strong>🧪 Test</strong> → harus muncul "✓ Worker OK — kurs..., X saham, Y crypto"</li>
+      </ol>
+
+      <div style="font-weight:600; color:var(--accent); margin-bottom:6px">4. (Opsional) Tambah Proteksi Token</div>
+      <ol style="margin-left:20px; margin-bottom:14px">
+        <li>Worker → tab <strong>Settings</strong> → <strong>Variables and Secrets</strong></li>
+        <li>Add variable: nama <code>SHARED_SECRET</code>, value = password random Anda</li>
+        <li>Deploy ulang</li>
+        <li>Paste secret yang sama ke field <strong>Token</strong> di Settings app</li>
+        <li>Ini mencegah orang lain pakai Worker Anda (opsional — quota free 100rb/hari sudah sangat besar)</li>
+      </ol>
+
+      <div style="font-weight:600; color:var(--accent); margin-bottom:6px">5. (Opsional) CoinGecko API Key</div>
+      <ol style="margin-left:20px; margin-bottom:14px">
+        <li>Kalau crypto sering gagal: daftar Demo key gratis di <a href="https://www.coingecko.com/en/api/pricing" target="_blank" rel="noopener">coingecko.com/en/api/pricing</a></li>
+        <li>Worker → Settings → Variables → add <code>COINGECKO_API_KEY</code> = key Anda</li>
+        <li>Deploy ulang</li>
+      </ol>
+
+      <div style="background:var(--gain-bg); padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:0.8rem">
+        <strong>✓ Selesai!</strong> Sekarang setiap klik 🔄 atau buka app, harga di-fetch real-time dari Worker. Tidak ada GitHub Action, tidak ada delay 15 menit, tidak ada error "rejected".
+      </div>
+
+      <div style="background:var(--info-bg, #E6EEF6); padding:10px 12px; border-radius:6px; font-size:0.8rem; border-left:3px solid #2C5F8D">
+        <strong>📊 Tentang Free Tier Cloudflare:</strong>
+        <ul style="margin-left:18px; margin-top:4px">
+          <li>100.000 request/hari (Anda pakai ~10-50/hari)</li>
+          <li>Tidak ada "cold start" — selalu instant</li>
+          <li>Tidak pernah idle-stop (beda dari GitHub Action)</li>
+          <li>Edge network global — cepat dari Indonesia</li>
+        </ul>
+      </div>
+    </div>
+  `;
+  document.getElementById('modalBackdrop').classList.add('active');
+}
+
 function showGithubGuide() {
   document.getElementById('modalTitle').textContent = '⭐ Setup GitHub Sync';
   document.getElementById('modalBody').innerHTML = `
@@ -5031,6 +5207,9 @@ window.githubPush = githubPush;
 window.githubInstallWorkflow = githubInstallWorkflow;
 window.githubTriggerAction = githubTriggerAction;
 window.showGithubGuide = showGithubGuide;
+window.showWorkerGuide = showWorkerGuide;
+window.updatePriceWorkerConfig = updatePriceWorkerConfig;
+window.testPriceWorker = testPriceWorker;
 window.updateAppsScriptConfig = updateAppsScriptConfig;
 
 document.addEventListener('DOMContentLoaded', init);
